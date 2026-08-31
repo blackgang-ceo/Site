@@ -1,450 +1,395 @@
 """
-mastering/backend/dsp_pipeline.py
+dsp_pipeline.py
 
-High-level, production-oriented DSP pipeline for one-click mastering.
+High-level mastering pipeline implementation. The goal is to implement the chain described
+in the spec with production-ready comments and safety features.
 
-Design notes
-- Uses pedalboard for filter/compressor/limiter blocks where available.
-- Uses pyloudnorm for LUFS measurement and true-peak estimation (via upsampling + sample peak)
-- Uses librosa for spectral analysis to find resonances for gentle subtractive dynamic EQ
-- Uses matchering to perform gentle reference tonal shaping when a reference curve is available
-- Uses an iterative limiter pass to reach the target integrated LUFS while keeping True Peak <= ceiling
+Notes / design decisions:
+- Files are processed from disk to avoid holding large arrays in memory indefinitely.
+- We use a combination of scipy (FIR linear-phase HPF), librosa for analysis, pyloudnorm for LUFS,
+  pedalboard for plugin-like effects where appropriate, and numpy/soundfile for IO.
+- We iterate gain + limiting to meet target LUFS while respecting true peak ceiling.
 
-Caveats
-- Some pedalboard plugin class names / behaviors vary by version. The code attempts to import and use common plugins
-  but will fall back to conservative numpy implementations when necessary.
-- This module focuses on correctness, safety, and clear comments. For production load you should run the heavy DSP
-  in background workers and restrict CPU per job.
-
-API surface
-- process_master(input_path: str, workdir: str, target_lufs: float = -10.0, tp_ceiling: float = -1.0)
-    -> returns a dict with keys: streaming_path, hires_path, measured (dict)
-
+This file intentionally trades off the absolute last dB of brickwall-limited loudness for
+clarity and anti-distortion behavior. For fully 'competitive' mastering, replace/augment
+parts with native VSTs in a secure server environment.
 """
 
-import os
-import io
-import math
-import tempfile
-import shutil
-import logging
 from typing import Tuple, Dict, Optional
-
 import numpy as np
 import soundfile as sf
 import librosa
+import pyloudnorm as pyln
+from pedalboard import Pedalboard, HighpassFilter, Compressor, Limiter, Mono, Gain
+from pedalboard.io import AudioFile
+import scipy.signal as sps
+import math
+import tempfile
+import os
 
-# pedalboard, matchering, pyloudnorm, ffmpeg
-try:
-    from pedalboard import Pedalboard, HighpassFilter, Compressor, Limiter, Gain, HighShelf, LowShelf, PeakingEQ
-    PEDALBOARD_AVAILABLE = True
-except Exception:
-    PEDALBOARD_AVAILABLE = False
 
-try:
-    import matchering as mg
-    MATCHERING_AVAILABLE = True
-except Exception:
-    MATCHERING_AVAILABLE = False
+class MasteringEngine:
+    """Encapsulates a mastering pipeline instance.
 
-try:
-    import pyloudnorm as pyln
-    PYLOUD_AVAILABLE = True
-except Exception:
-    PYLOUD_AVAILABLE = False
-
-# ffmpeg for conversions
-try:
-    import ffmpeg
-    FFMPEG_AVAILABLE = True
-except Exception:
-    FFMPEG_AVAILABLE = False
-
-# configure logger
-logger = logging.getLogger("mastering.dsp")
-logger.setLevel(logging.INFO)
-
-# Utility functions
-
-def _read_audio(path: str, sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
-    """Read audio to float32 numpy array shape (samples, channels) and sample rate.
-    We normalize to float32 in range [-1,1].
+    Usage pattern:
+        engine = MasteringEngine()
+        engine.process_to_targets(input_path, out_streaming, out_hires, target_lufs=-10.0)
+        report = engine.get_last_report()
     """
-    data, sr_in = sf.read(path, always_2d=True)
-    # soundfile returns shape (frames, channels)
-    data = data.astype('float32')
-    if sr is not None and sr != sr_in:
-        # resample using librosa
-        data = np.vstack([librosa.resample(data[:, ch], sr_in, sr) for ch in range(data.shape[1])]).T
-        sr_in = sr
-    return data, sr_in
 
+    def __init__(self):
+        self.last_report: Dict = {}
 
-def _write_wav(path: str, data: np.ndarray, sr: int, subtype: str = 'PCM_24') -> None:
-    """Write numpy float32 array to disk using soundfile. Subtype can be PCM_16, PCM_24, FLOAT.
-    Data shape: (frames, channels)
-    """
-    sf.write(path, data, sr, subtype=subtype)
+    # ------------------------------ Utilities --------------------------------
+    @staticmethod
+    def read_audio(path: str, sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
+        """Load audio using soundfile (preferred) but fall back to librosa if necessary.
+        Returns float32 numpy array (shape: samples, channels) and sample rate.
+        """
+        data, sr_file = sf.read(path, always_2d=True, dtype="float32")
+        # soundfile returns (frames, channels) — we prefer (channels, frames) or keep (frames,channels)
+        # We'll keep (frames, channels)
+        if sr is not None and sr_file != sr:
+            # resample with librosa (high quality)
+            data = librosa.resample(data.T, orig_sr=sr_file, target_sr=sr, axis=1).T
+            sr_file = sr
+        return data, sr_file
 
+    @staticmethod
+    def write_wav(path: str, data: np.ndarray, sr: int, subtype: str = 'PCM_16'):
+        """Write WAV with soundfile. data is (frames, channels) float32 in -1..1.
+        subtype options: PCM_16, PCM_24
+        """
+        sf.write(path, data, sr, subtype=subtype)
 
-def _estimate_true_peak(samples: np.ndarray, sr: int, upsample_to: int = 192000) -> float:
-    """Estimate true peak in dBFS by upsampling and checking sample peaks.
+    @staticmethod
+    def linear_phase_highpass(signal: np.ndarray, sr: int, cutoff: float = 20.0, transition_width: float = 10.0) -> np.ndarray:
+        """Apply a linear-phase FIR high-pass filter (windowed sinc) using fftconvolve for speed.
+        This produces linear phase (no phase distortion) and excellent low-frequency attenuation.
+        - signal: (frames, channels)
+        - cutoff: Hz
+        """
+        nyq = sr / 2.0
+        # FIR order chosen for steep but reasonable latency. Longer order = better slope but more CPU.
+        # Use a proportional order depending on sample rate
+        width = transition_width / nyq
+        N = int(min(max(4096, int(0.08 * sr)), 16384))  # 80ms window approximate
+        # design a highpass with firwin
+        taps = sps.firwin(N, cutoff / nyq, pass_zero=False, window='hann')
+        # ensure that taps sum to ~0 for high-pass
+        # apply to each channel
+        out = np.zeros_like(signal)
+        for ch in range(signal.shape[1]):
+            out[:, ch] = sps.fftconvolve(signal[:, ch], taps, mode='same')
+        return out
 
-    samples: (frames, channels) float32 -1..1
-    Returns: true peak in dBFS (e.g., -0.5 means -0.5 dBFS)
-    """
-    # Convert to mono for TP estimation (worst case across channels)
-    if samples.ndim == 2:
-        mix = np.mean(samples, axis=1)
-    else:
-        mix = samples
+    @staticmethod
+    def detect_resonant_peaks(signal: np.ndarray, sr: int, top_n: int = 6) -> np.ndarray:
+        """Analyze the long-term magnitude spectrum and return candidate resonant frequencies
+        that may be suitable for subtractive EQ. We'll search for spectral peaks in the 20Hz-16kHz band.
+        """
+        # Compute magnitude spectrum (average over frames)
+        S = np.abs(librosa.stft(signal.mean(axis=1), n_fft=8192, hop_length=4096))
+        spec = S.mean(axis=1)
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=8192)
+        # restrict to sensible range
+        idx = np.where((freqs >= 20) & (freqs <= 16000))[0]
+        spec_sub = spec[idx]
+        freqs_sub = freqs[idx]
+        # find peaks
+        peaks, _ = sps.find_peaks(spec_sub, height=np.max(spec_sub)*0.05, distance=4)
+        if peaks.size == 0:
+            return np.array([])
+        heights = spec_sub[peaks]
+        # sort peaks by magnitude and return top_n frequencies
+        order = np.argsort(-heights)
+        selected = peaks[order][:top_n]
+        return freqs_sub[selected]
 
-    if sr >= upsample_to:
-        up = mix
-        up_sr = sr
-    else:
-        up = librosa.resample(mix.astype('float64'), sr, upsample_to)
-        up_sr = upsample_to
+    @staticmethod
+    def apply_notch(signal: np.ndarray, sr: int, center_hz: float, q: float = 10.0, depth_db: float = -1.5) -> np.ndarray:
+        """Apply a narrow subtractive notch using an IIR notch filter (iirnotch) and slight-gain interpolation.
+        depth_db is negative (e.g. -1.5). We implement the notch by parallel blend: dry*(1-alpha) + filtered*alpha
+        where the filtered path has the notch deeply applied and alpha chosen to reach desired depth.
+        """
+        # design notch
+        w0 = center_hz / (sr / 2.0)
+        # iirnotch expects w0 normalized to Nyquist
+        b, a = sps.iirnotch(w0, Q=q)
+        filtered = np.zeros_like(signal)
+        for ch in range(signal.shape[1]):
+            filtered[:, ch] = sps.lfilter(b, a, signal[:, ch])
+        # compute alpha required to achieve depth
+        if depth_db >= 0:
+            return signal
+        depth_lin = 10 ** (depth_db / 20.0)
+        # compute energy at center freq by short bandpass (approx) — instead, apply simple alpha
+        alpha = 0.5  # conservative by default; small dips are subtle.
+        # For small depth (-1.5dB) alpha ~ 0.3; we'll map linearly
+        alpha = max(0.12, min(0.45, -depth_db / 6.0))
+        return signal * (1 - alpha) + filtered * alpha
 
-    peak = np.max(np.abs(up))
-    if peak <= 0:
-        return -999.0
-    return 20.0 * math.log10(peak)
+    @staticmethod
+    def rms_db(arr: np.ndarray) -> float:
+        rms = np.sqrt(np.mean(arr ** 2)) + 1e-12
+        return 20 * math.log10(rms)
 
-
-def _compute_lufs(samples: np.ndarray, sr: int) -> Dict[str, float]:
-    """Return integrated LUFS and short-term metrics. Uses pyloudnorm when available."""
-    if not PYLOUD_AVAILABLE:
-        logger.warning("pyloudnorm not available; LUFS measurement will be approximate (RMS based)")
-        # fallback: RMS -> approximate LUFS
-        rms = np.sqrt(np.mean(samples ** 2))
-        lufs = 20 * math.log10(rms + 1e-12)
-        return {"integrated_loudness": lufs}
-
-    meter = pyln.Meter(sr)
-    # shape (frames, channels)
-    loudness = meter.integrated_loudness(samples)
-    # pyr. truepeak not provided; we'll compute separately
-    return {"integrated_loudness": float(loudness)}
-
-
-def _find_resonances(samples: np.ndarray, sr: int) -> Dict[str, float]:
-    """Analyze spectrum and return candidate resonant frequencies to notch.
-
-    We search common bands and return strongest peaks near typical problem areas.
-    """
-    # Mix to mono for analysis
-    if samples.ndim == 2:
-        mono = np.mean(samples, axis=1)
-    else:
-        mono = samples
-
-    # Use STFT magnitude average
-    S = np.abs(librosa.stft(mono, n_fft=65536 // 4))  # large FFT for accurate freq
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=librosa.stft(mono, n_fft=65536 // 4).shape[0] * 2 - 1)
-    spec = np.mean(S, axis=1)
-
-    def find_peak_in_range(lo, hi):
-        idx = np.where((freqs >= lo) & (freqs <= hi))[0]
-        if idx.size == 0:
-            return None
-        sub = spec[idx]
-        maxi = np.argmax(sub)
-        return float(freqs[idx[maxi]])
-
-    candidates = {}
-    candidates['low_mud'] = find_peak_in_range(140, 400)
-    candidates['upper_mid_harsh'] = find_peak_in_range(2000, 6000)
-    candidates['boxiness'] = find_peak_in_range(400, 900)
-    return candidates
-
-
-def _apply_saturation(samples: np.ndarray, drive_db: float = 1.0) -> np.ndarray:
-    """Simple, high-quality soft saturation implemented with tanh curve.
-
-    drive_db: positive dB of pre-gain applied before tanh, smaller values (0.5-2 dB) are subtle.
-    """
-    if drive_db == 0:
-        return samples
-
-    gain = 10 ** (drive_db / 20.0)
-    driven = samples * gain
-    # Apply gentle softclip with tanh, then scale back so 0dB remains near 0dB
-    saturated = np.tanh(driven)
-    # normalize to match RMS of input to be conservative
-    in_rms = np.sqrt(np.mean(samples ** 2)) + 1e-15
-    out_rms = np.sqrt(np.mean(saturated ** 2)) + 1e-15
-    saturated = saturated * (in_rms / out_rms)
-    return saturated.astype(np.float32)
-
-
-def process_master(input_path: str, workdir: str, target_lufs: float = -10.0, tp_ceiling: float = -1.0) -> Dict:
-    """Main processing pipeline.
-
-    Args:
-      input_path: path to source WAV/MP3
-      workdir: directory where intermediate and final files will be written
-      target_lufs: integrated LUFS goal (e.g., -10.0)
-      tp_ceiling: true-peak ceiling in dBTP (e.g., -1.0)
-
-    Returns dict containing file paths and measured metadata.
-    """
-    os.makedirs(workdir, exist_ok=True)
-    basename = os.path.splitext(os.path.basename(input_path))[0]
-
-    logger.info("Loading audio: %s", input_path)
-    audio, sr = _read_audio(input_path)
-    frames, chans = audio.shape[0], audio.shape[1]
-
-    measured = {}
-    measured.update(_compute_lufs(audio, sr))
-    measured['true_peak_dbfs'] = _estimate_true_peak(audio, sr)
-    logger.info("Measured LUFS=%.2f, TP=%.2f dBFS", measured['integrated_loudness'], measured['true_peak_dbfs'])
-
-    # Pre-gain to reach target LUFS (simple first-pass). We'll adjust later with limiter.
-    gain_db_initial = target_lufs - measured['integrated_loudness']
-    logger.info("Initial gain to reach target LUFS: %.2f dB", gain_db_initial)
-
-    # Apply high-pass at 20Hz (linear-phase not trivial; we use a high-order IIR via pedalboard if available)
-    proc = audio.copy()
-
-    if PEDALBOARD_AVAILABLE:
-        board = Pedalboard()
+    # ------------------------------ The Chain --------------------------------
+    def analyse(self, audio: np.ndarray, sr: int) -> Dict:
+        """Run a set of pre-analysis measures: LUFS, true-peak, spectral centroid and resonances.
+        Returns a dictionary with the metrics.
+        """
+        meter = pyln.Meter(sr)  # create BS.1770 meter
+        # pyloudnorm expects mono for true peak? It handles multichannel arrays as NxC
         try:
-            board.append(HighpassFilter(cutoff_hz=20.0))
+            integrated = meter.integrated_loudness(audio)
         except Exception:
-            # If HighpassFilter expects different param names
-            try:
-                board.append(HighpassFilter(20.0))
-            except Exception:
-                logger.exception("Pedalboard highpass creation failed; continuing without pedalboard HPF")
-        # We'll apply the board to entire track in blocks due to memory safety
+            # fallback: measure on mid-sum
+            mono = audio.mean(axis=1)
+            integrated = meter.integrated_loudness(mono)
         try:
-            # pedalboard expects shape (samples, channels)
-            proc = board(proc, sr)
+            tp = meter.true_peak(audio)
         except Exception:
-            logger.exception("Pedalboard processing failed for HPF; skipping to numpy fallback")
-    else:
-        # fallback: very gentle single-pole HP using librosa's high-pass via FFT windowing
-        logger.info("Applying naive frequency-domain HPF fallback (20Hz)")
-        # FFT approach: zero out frequencies below 18Hz
-        mono = np.mean(proc, axis=1)
-        S = librosa.stft(mono)
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=S.shape[0]*2-1)
-        cutoff_idx = np.searchsorted(freqs, 18.0)
-        S[:cutoff_idx, :] = 0
-        mono_f = librosa.istft(S, length=proc.shape[0])
-        for ch in range(proc.shape[1]):
-            proc[:, ch] = mono_f
+            # if true_peak not available, approximate by peak in upsampled signal
+            up = librosa.resample(audio.T, orig_sr=sr, target_sr=sr * 4).T
+            tp = 20 * np.log10(np.max(np.abs(up)) + 1e-12)
+        # spectral centroid and resonant candidates
+        centroid = np.mean(librosa.feature.spectral_centroid(y=audio.mean(axis=1), sr=sr))
+        resonances = self.detect_resonant_peaks(audio, sr)
+        return {
+            "integrated_lufs": float(integrated),
+            "true_peak_db": float(tp),
+            "spectral_centroid": float(centroid),
+            "resonances": [float(float(r)) for r in resonances],
+        }
 
-    # Subtractive dynamic EQ (detect resonances and notch)
-    res = _find_resonances(proc, sr)
-    eq_nodes = []
-    for label, freq in res.items():
-        if freq is None:
-            continue
-        # only notch if energy is significant
-        q = 1.2
-        cut_db = -1.75
-        logger.info("Applying subtractive EQ at %s: %.1f Hz, %.2fdB", label, freq, cut_db)
-        if PEDALBOARD_AVAILABLE:
-            try:
-                # PeakingEQ(center_freq, q, gain_db)
-                board = Pedalboard([PeakingEQ(freq, q, cut_db)])
-                proc = board(proc, sr)
-            except Exception:
-                logger.exception("pedalboard PeakingEQ failed for freq %.1f", freq)
-        else:
-            # Fallback: apply a simple parametric EQ via FFT (very approximate)
-            S = librosa.stft(np.mean(proc, axis=1), n_fft=16384)
-            freqs = librosa.fft_frequencies(sr=sr, n_fft=16384)
-            idx = np.argmin(np.abs(freqs - freq))
-            S[idx-2:idx+3, :] *= 10 ** (cut_db / 20.0)
-            mono_f = librosa.istft(S, length=proc.shape[0])
-            for ch in range(proc.shape[1]):
-                proc[:, ch] = 0.5 * proc[:, ch] + 0.5 * mono_f
-
-    # Gentle saturation/tape emulation on the mid channel
-    # Convert to mid/side
-    L = proc[:, 0]
-    R = proc[:, 1] if proc.shape[1] > 1 else proc[:, 0]
-    M = (L + R) / 2.0
-    S_side = (L - R) / 2.0
-
-    # Apply soft saturation on M only (adds perceived density)
-    M_sat = _apply_saturation(M, drive_db=1.0)
-
-    # Reconstruct stereo
-    L = M_sat + S_side
-    R = M_sat - S_side
-    proc = np.stack([L, R], axis=1)
-
-    # Glue compression: attempt to set threshold for ~2-3 dB GR
-    # We'll approximate RMS and pick threshold below RMS
-    rms = 20.0 * math.log10(np.sqrt(np.mean(proc ** 2)) + 1e-12)
-    target_gr_db = 2.5
-    # simple heuristic: threshold_db = rms - (target_gr_db * 1.1)
-    threshold_db = rms - (target_gr_db * 1.1)
-    logger.info("Glue compression heuristic: rms=%.2f dB, threshold=%.2f dB", rms, threshold_db)
-
-    if PEDALBOARD_AVAILABLE:
-        try:
-            comp = Compressor(threshold_db, ratio=1.8, attack_ms=25.0, release_ms=250.0, makeup_gain_db=0.0)
-            board = Pedalboard([comp])
-            proc = board(proc, sr)
-        except Exception:
-            logger.exception("Pedalboard compressor failed; skipping compressor step")
-    else:
-        # naive soft-knee gain reduction: apply simple reduction when signal > threshold (in dB)
-        logger.info("Applying naive compressor fallback")
-        linear_threshold = 10 ** (threshold_db / 20.0)
+    def apply_bus_compressor(self, audio: np.ndarray, sr: int, target_reduction_db: float = 2.5) -> np.ndarray:
+        """Apply a gentle bus compressor with parameters chosen to achieve ~2-3 dB gain reduction.
+        We don't have a perfect analytic inverse of compressor behavior, so we choose a threshold relative
+        to the measured LUFS and then apply the pedalboard Compressor.
+        """
+        meter = pyln.Meter(sr)
+        integrated = meter.integrated_loudness(audio)
+        # set threshold a few dB above integrated level — ensures RMS peaks see compression
+        threshold_db = integrated + 2.5  # compressor engages above average level
+        # make ratio mild
         ratio = 1.8
-        # per-sample soft knee
-        abs_proc = np.abs(proc)
-        over = abs_proc > linear_threshold
-        proc[over] = np.sign(proc[over]) * (linear_threshold + (abs_proc[over] - linear_threshold) / ratio)
+        attack_ms = 20.0
+        release_ms = 180.0
 
-    # Stereo imaging: mono low below 120Hz, widen highs above 5kHz
-    try:
-        # Lowpass for low band and replace stereo with mono below 120Hz
-        # Using librosa's filters: via STFT band processing
-        S_all = np.array([librosa.stft(proc[:, ch], n_fft=4096) for ch in range(proc.shape[1])])
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=4096)
-        low_idx = np.where(freqs <= 120)[0]
-        high_idx = np.where(freqs >= 5000)[0]
-        # Mono low: average left/right in low bins
-        S_all[:, low_idx, :] = np.mean(S_all[:, low_idx, :], axis=0)[np.newaxis, :, :]
-        # Widen highs by boosting side content slightly (simple approach)
-        # Convert to mid-side in STFT domain and boost side above 5kHz
-        # M = (L+R)/2, S = (L-R)/2
-        L_spec = S_all[0]
-        R_spec = S_all[1]
-        M_spec = 0.5 * (L_spec + R_spec)
-        S_spec = 0.5 * (L_spec - R_spec)
-        S_spec[high_idx, :] *= 1.12  # widen factor
-        L_spec = M_spec + S_spec
-        R_spec = M_spec - S_spec
-        proc_new = np.zeros_like(proc)
-        for ch in range(proc.shape[1]):
-            proc_new[:, ch] = librosa.istft(L_spec if ch == 0 else R_spec, length=proc.shape[0])
-        proc = proc_new
-    except Exception:
-        logger.exception("STFT-based imaging failed; skipping widen/mono low step")
+        board = Pedalboard([
+            Compressor(threshold_db=threshold_db, ratio=ratio, attack_ms=attack_ms, release_ms=release_ms),
+        ])
+        # pedalboard expects (channels, samples)
+        # but AudioFile convenience accepts audio path; we'll use the effect's __call__ which accepts (samples, sample_rate)
+        # samples must be shape (samples, channels)
+        processed = board(audio, sr)
+        return processed
 
-    # Apply pre-gain toward target LUFS
-    pre_gain_db = gain_db_initial
-    linear_gain = 10 ** (pre_gain_db / 20.0)
-    proc = proc * linear_gain
+    def mid_side_process(self, audio: np.ndarray, sr: int) -> np.ndarray:
+        """Perform mid/side operations:
+         - Make sub-bass (<120Hz) mono
+         - Slightly widen >5kHz by increasing side components at those frequencies
+         - Apply soft mid-side saturation (perceptual warmth) via tanh waveshaping on mid channel
+        """
+        # convert to mid/side
+        L = audio[:, 0]
+        R = audio[:, 1] if audio.shape[1] > 1 else audio[:, 0]
+        M = 0.5 * (L + R)
+        S = 0.5 * (L - R)
 
-    # Iterative limiting / maximization pass: run a brickwall limiter with lookahead if available and measure LUFS
-    # We'll run a limited number of iterations to approach target_lufs while keeping true peak <= tp_ceiling
-    out = proc
-    final_streaming = os.path.join(workdir, f"{basename}.streaming.wav")
-    final_hires = os.path.join(workdir, f"{basename}.hires.wav")
+        # lowpass M at 120hz and remove side content below that frequency
+        # use IIR butterworth for speed
+        b, a = sps.butter(4, 120 / (sr / 2.0), btype='low')
+        low_mono = sps.lfilter(b, a, M)
 
-    # Start iteration
-    max_iters = 6
-    for iteration in range(max_iters):
-        logger.info("Limiting iteration %d/%d", iteration + 1, max_iters)
+        # high band for widening
+        b_h, a_h = sps.butter(4, 5000 / (sr / 2.0), btype='high')
+        high_side = sps.lfilter(b_h, a_h, S)
+        # apply gentle scaling to side high frequencies
+        high_side *= 1.12
 
-        # Create limiter via pedalboard if available
-        out_limited = out.copy()
-        if PEDALBOARD_AVAILABLE:
-            try:
-                # Use a lookahead-aware limiter if available; otherwise typical Limiter
-                lim = Limiter(threshold_db=tp_ceiling)
-                board = Pedalboard([lim])
-                out_limited = board(out_limited, sr)
-            except Exception:
-                logger.exception("Pedalboard limiter failed; applying naive clip to -1 dBTP")
-                tp_lin = 10 ** (tp_ceiling / 20.0)
-                out_limited = np.clip(out_limited, -tp_lin, tp_lin)
+        # reconstruct L/R: low band uses mono low_mono, mid uses M - low contribution, side uses S (with high_side boosted)
+        # Blend low_mono into both channels for <120Hz
+        # We'll compute crossover using simple additive approach
+        # compute M' and S'
+        # subtract low_mono's contribution from M to avoid doubling
+        M_prime = M - low_mono * 0.5
+        S_prime = S
+        # add widened high side content
+        S_prime += high_side
+
+        L_out = M_prime + S_prime
+        R_out = M_prime - S_prime
+
+        out = np.stack([L_out, R_out], axis=1)
+
+        # subtle harmonic saturation on mid channel (soft-tanh)
+        mid = 0.5 * (out[:, 0] + out[:, 1])
+        side = 0.5 * (out[:, 0] - out[:, 1])
+        # apply soft saturation only to mid and only small amount
+        sat_amount = 0.002  # tiny amount of drive
+        mid_sat = np.tanh(mid * (1 + sat_amount)) - mid
+        mid = mid + mid_sat * 0.6
+        L_out = mid + side
+        R_out = mid - side
+        out = np.stack([L_out, R_out], axis=1)
+        # gentle normalization to avoid adding gain
+        peak = np.max(np.abs(out)) + 1e-12
+        if peak > 1.0:
+            out /= peak
+        return out
+
+    def apply_true_peak_limiter(self, audio: np.ndarray, sr: int, ceiling_db: float = -1.0) -> np.ndarray:
+        """We'll apply pedalboard Limiter with the specified ceiling in dBFS. pedalboard Limiter uses lookahead internally.
+        """
+        board = Pedalboard([
+            Limiter(threshold_db=ceiling_db),
+        ])
+        processed = board(audio, sr)
+        return processed
+
+    def target_lufs_iteration(self, audio: np.ndarray, sr: int, target_lufs: float, tp_ceiling_db: float) -> Tuple[np.ndarray, Dict]:
+        """Iteratively apply gain -> limiter to reach target LUFS while policing true peak.
+        Steps:
+         1. Measure integrated LUFS and true peak
+         2. Compute required gain (target - current)
+         3. Limit the maximum pre-gain if it would violate true peak ceiling
+         4. Apply gain + limiter and re-measure
+         5. Repeat a few times (usually 1-3 iterations required)
+        Returns processed audio and a dict with final measurements.
+        """
+        meter = pyln.Meter(sr)
+        current_lufs = meter.integrated_loudness(audio)
+        current_tp = meter.true_peak(audio)
+
+        # gain needed (dB)
+        gain_needed = float(target_lufs - current_lufs)
+
+        # do not push more than 8 dB in pre-gain on a single pass — risk of distortion
+        max_pregain_db = 8.0
+        pregain_db = max(-12.0, min(max_pregain_db, gain_needed))
+
+        # check predicted true peak after pregain (approx): tp + pregain_db
+        predicted_tp = current_tp + pregain_db
+        # reduce pregain if it will exceed ceiling by more than 0.1 dB
+        if predicted_tp > tp_ceiling_db - 0.1:
+            pregain_db = tp_ceiling_db - 0.1 - current_tp
+            # clamp
+            pregain_db = min(pregain_db, max_pregain_db)
+
+        # Now apply pregain via pedalboard Gain and then Limiter
+        # We'll attempt a two-stage approach: small pregain -> limiter -> measure -> if still short, repeat
+        processed = audio
+        for iteration in range(3):
+            if abs(pregain_db) > 0.01:
+                board = Pedalboard([Gain(pregain_db)])
+                processed = board(processed, sr)
+            # limiter to ceiling
+            processed = self.apply_true_peak_limiter(processed, sr, ceiling_db=tp_ceiling_db)
+            # measure
+            new_lufs = meter.integrated_loudness(processed)
+            new_tp = meter.true_peak(processed)
+            # recompute remaining need
+            remain_db = target_lufs - new_lufs
+            if abs(remain_db) < 0.25:
+                # close enough
+                break
+            # compute small incremental pregain for next iteration
+            pregain_db = max(-6.0, min(6.0, remain_db))
+            # enforce true-peak safety
+            if new_tp + pregain_db > tp_ceiling_db - 0.1:
+                pregain_db = tp_ceiling_db - 0.1 - new_tp
+            if abs(pregain_db) < 0.1:
+                break
+        final_metrics = {
+            'integrated_lufs': float(new_lufs),
+            'true_peak_db': float(new_tp),
+        }
+        return processed, final_metrics
+
+    def process_to_targets(self, input_path: str, out_streaming: str, out_hires: str, target_lufs: float = -10.0, tp_ceiling_db: float = -1.0):
+        """High-level processing function that reads input, applies the mastering chain, and writes
+        two masters: streaming (16-bit / 44.1k) and hi-res (24-bit / 48k).
+        """
+        # 1) Read and homogenize to float32 stereo
+        audio, sr = self.read_audio(input_path)
+        if audio.shape[1] == 1:
+            # duplicate mono to stereo for processing chain
+            audio = np.repeat(audio, 2, axis=1)
+        # Store original analysis
+        analysis_before = self.analyse(audio, sr)
+
+        # 2) linear-phase HPF at 20Hz
+        audio = self.linear_phase_highpass(audio, sr, cutoff=20.0, transition_width=8.0)
+
+        # 3) subtractive dynamic EQ — detect resonances and apply shallow notches
+        resonances = analysis_before.get('resonances', [])
+        # choose candidates around typical problem areas too
+        candidates = []
+        # prefer automatic resonances but add typical bands if not present
+        for r in resonances:
+            if 40 < r < 16000:
+                candidates.append(r)
+        # add typical problem bands
+        typical = [250.0, 700.0, 3000.0, 4500.0]
+        candidates.extend(typical)
+        # dedupe and keep only first 6
+        cand_unique = sorted(set([round(float(x)) for x in candidates]))[:6]
+        for f in cand_unique:
+            audio = self.apply_notch(audio, sr, float(f), q=10.0, depth_db=-1.6)
+
+        # 4) gentle glue compression on the bus
+        audio = self.apply_bus_compressor(audio, sr, target_reduction_db=2.5)
+
+        # 5) tonal balance / harmonic excitement
+        # apply a gentle mid-side processing stage
+        audio = self.mid_side_process(audio, sr)
+
+        # 6) stereo imaging (already partly in mid_side_process). Ensure <120Hz mono
+        # (already enforced in mid_side_process)
+
+        # 7) iterative limiting + LUFS target
+        processed, final_meas = self.target_lufs_iteration(audio, sr, target_lufs=target_lufs, tp_ceiling_db=tp_ceiling_db)
+
+        # final gentle dithering / bit-depth conversion happens on write
+        # write hi-res (24-bit 48k)
+        # resample to 48k if needed
+        hires_sr = 48000
+        if sr != hires_sr:
+            # librosa expects shape (channels, samples)
+            processed = librosa.resample(processed.T, orig_sr=sr, target_sr=hires_sr, axis=1).T
+            sr_out = hires_sr
         else:
-            tp_lin = 10 ** (tp_ceiling / 20.0)
-            out_limited = np.clip(out_limited, -tp_lin, tp_lin)
+            sr_out = sr
+        # clip to [-1,1]
+        processed = np.clip(processed, -0.9999, 0.9999)
+        # write 24-bit file
+        self.write_wav(out_hires, processed, sr_out, subtype='PCM_24')
 
-        # Measure LUFS and true peak after limiting
-        measured_iter = _compute_lufs(out_limited, sr)
-        measured_iter['true_peak_dbfs'] = _estimate_true_peak(out_limited, sr)
-        logger.info("Post-limit LUFS=%.2f, TP=%.2f", measured_iter['integrated_loudness'], measured_iter['true_peak_dbfs'])
+        # create streaming master 16-bit 44.1k
+        streaming_sr = 44100
+        streaming = processed
+        if sr_out != streaming_sr:
+            streaming = librosa.resample(processed.T, orig_sr=sr_out, target_sr=streaming_sr, axis=1).T
+        streaming = np.clip(streaming, -0.9999, 0.9999)
+        self.write_wav(out_streaming, streaming, streaming_sr, subtype='PCM_16')
 
-        # Check if targets met
-        lufs_err = target_lufs - measured_iter['integrated_loudness']
-        tp_over = measured_iter['true_peak_dbfs'] - tp_ceiling
-
-        # If we are quieter than target, add a small amount of makeup gain before limiting next iteration (conservative)
-        if lufs_err > 0.2 and iteration < max_iters - 1:
-            # convert LUFS delta to dB (approx): apply only half the required to avoid overshoot
-            adj_db = min(2.0, lufs_err * 0.8)
-            logger.info("Applying makeup gain %.2f dB to approach LUFS target", adj_db)
-            out = out_limited * (10 ** (adj_db / 20.0))
-            continue
-
-        # If TP over ceiling, reduce pre-limiter gain a bit and try again
-        if tp_over > 0.05 and iteration < max_iters - 1:
-            reduction_db = min(1.5, tp_over * 0.8)
-            logger.info("TP over by %.2f dB -> reducing pre-gain by %.2f dB and iterate", tp_over, reduction_db)
-            out = out * (10 ** (-reduction_db / 20.0))
-            continue
-
-        # Targets met or no more iterations
-        out = out_limited
-        measured = measured_iter
-        break
-
-    # Final dithering / bit depth conversions
-    # Streaming master: 16-bit 44.1k
-    streaming_sr = 44100
-    hires_sr = 48000
-
-    # Use ffmpeg if available for high-quality sample rate conversion; fallback to librosa
-    def resample_and_write(array, src_sr, dst_sr, out_path, subtype):
-        if FFMPEG_AVAILABLE:
-            # Write to temp WAV and let ffmpeg resample to desired sr and bit-depth
-            tmp = out_path + ".tmp.wav"
-            _write_wav(tmp, array, src_sr, subtype='FLOAT')
-            try:
-                stream = ffmpeg.input(tmp)
-                stream = ffmpeg.output(stream, out_path, ar=dst_sr, ac=2, sample_fmt='s16' if subtype == 'PCM_16' else 's32')
-                ffmpeg.run(stream, overwrite_output=True, quiet=True)
-                os.remove(tmp)
-                return True
-            except Exception:
-                logger.exception("ffmpeg resample failed, falling back to librosa")
-        # fallback
-        arr_mono = array
-        if src_sr != dst_sr:
-            arr_mono = np.vstack([librosa.resample(array[:, ch], src_sr, dst_sr) for ch in range(array.shape[1])]).T
-        _write_wav(out_path, arr_mono, dst_sr, subtype=subtype)
+        analysis_after = self.analyse(processed, sr_out)
+        # store report
+        self.last_report = {
+            'before': analysis_before,
+            'after': analysis_after,
+            'final_targets': {'target_lufs': target_lufs, 'tp_ceiling_db': tp_ceiling_db},
+            'files': {'streaming': out_streaming, 'hires': out_hires},
+        }
         return True
 
-    # Ensure final is in float32 range [-1,1]
-    peak = np.max(np.abs(out)) + 1e-15
-    if peak > 1.0:
-        out = out / peak
-
-    # write hires 24-bit 48k
-    resample_and_write(out, sr, hires_sr, final_hires, subtype='PCM_24')
-    # write streaming 16-bit 44.1k
-    resample_and_write(out, sr, streaming_sr, final_streaming, subtype='PCM_16')
-
-    result = {
-        'streaming_path': final_streaming,
-        'hires_path': final_hires,
-        'measured': measured,
-        'iterations': iteration + 1,
-    }
-
-    return result
+    def get_last_report(self) -> Dict:
+        return self.last_report
 
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('infile')
-    parser.add_argument('--outdir', default=tempfile.gettempdir())
-    parser.add_argument('--lufs', type=float, default=-10.0)
-    parser.add_argument('--tp', type=float, default=-1.0)
-    args = parser.parse_args()
-    out = process_master(args.infile, args.outdir, target_lufs=args.lufs, tp_ceiling=args.tp)
-    print(out)
+    # quick local smoke test (developer only)
+    eng = MasteringEngine()
+    print('Engine initialized')

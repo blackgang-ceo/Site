@@ -1,109 +1,110 @@
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+# Mastering backend FastAPI server
+# main.py — exposes /process endpoint that accepts an audio file and returns processed masters (streaming)
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import uuid
-import os
+import uvicorn
 import shutil
+import os
 import tempfile
+from pathlib import Path
+from dsp_pipeline import MasteringEngine
 import asyncio
-from typing import Dict
 
-from .dsp_pipeline import process_mastering
+app = FastAPI(title="BLACKGANG One-Click Mastering - Backend",
+              description="FastAPI backend that runs an automated mastering chain.")
 
-app = FastAPI(title="BLACKGANG Mastering Engine")
-
-# Allow local frontend dev to talk to backend — tighten in production
+# configure CORS so the Next.js frontend (localhost:3000) can talk to it
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-WORKDIR = os.path.join(os.getcwd(), "mastering", "jobs")
-os.makedirs(WORKDIR, exist_ok=True)
+# Create a single engine instance; it is stateless per call but we keep it for convenience
+engine = MasteringEngine()
 
-# In-memory job status store (simple). For production, replace with Redis or DB.
-jobs: Dict[str, Dict] = {}
+OUTPUT_DIR = Path(tempfile.gettempdir()) / "blackgang_mastering_outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+@app.post("/process")
+async def process_audio(file: UploadFile = File(...), target_lufs: float = -10.0):
+    """
+    Accepts an uploaded audio file (wav/mp3/m4a) and returns JSON with links to
+    the processed files (streaming master and hi-res master). Files are stored
+    temporarily in the system temp directory and will be cleaned up by caller or periodic job.
 
-@app.post('/api/master')
-async def upload_and_master(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
-    # Accept a single file, store to temp file, start background processing
-    if not file.filename.lower().endswith(('.wav', '.mp3', '.m4a', '.aiff', '.flac')):
-        raise HTTPException(status_code=400, detail="Unsupported file type")
+    Query params:
+    - target_lufs: desired integrated LUFS (default -10.0). We'll clamp to [-14, -8].
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
 
-    job_id = str(uuid.uuid4())
-    job_dir = os.path.join(WORKDIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
+    # clamp target lufs to a safe commercial range
+    target_lufs = max(-14.0, min(-8.0, float(target_lufs)))
 
-    input_path = os.path.join(job_dir, "input")
-    # Save upload to disk in streaming fashion
-    with open(input_path, 'wb') as f:
-        while True:
-            chunk = await file.read(1024*1024)
-            if not chunk:
-                break
-            f.write(chunk)
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in [".wav", ".mp3", ".m4a", ".aiff", ".flac"]:
+        # let ffmpeg handle some conversions but validate extension roughly
+        pass
 
-    jobs[job_id] = {
-        'status': 'queued',
-        'phase': 'queued',
-        'progress': 0,
-        'result': None,
-        'job_dir': job_dir
-    }
+    # create safe temp files
+    input_fd, input_path = tempfile.mkstemp(suffix=suffix, prefix="bgang_input_")
+    os.close(input_fd)
 
-    # Launch background processing
-    background_tasks.add_task(_run_processing, job_id, input_path)
-
-    return JSONResponse({ 'job_id': job_id })
-
-
-async def _run_processing(job_id: str, input_path: str):
-    jobs[job_id]['status'] = 'running'
     try:
-        def progress_cb(phase, pct):
-            jobs[job_id]['phase'] = phase
-            jobs[job_id]['progress'] = pct
+        # stream uploaded file to disk (avoids loading huge files into memory)
+        with open(input_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
 
-        # Run the heavy DSP in a threadpool so it doesn't block event loop
-        loop = asyncio.get_event_loop()
-        out_files = await loop.run_in_executor(None, process_mastering, input_path, jobs[job_id]['job_dir'], progress_cb)
+        # process - this is run in threadpool to avoid blocking event loop
+        loop = asyncio.get_running_loop()
+        # produce two outputs: streaming (16/44.1) and hires (24/48)
+        out_streaming = OUTPUT_DIR / (Path(file.filename).stem + "_streaming.wav")
+        out_hires = OUTPUT_DIR / (Path(file.filename).stem + "_hires.wav")
 
-        jobs[job_id]['status'] = 'done'
-        jobs[job_id]['result'] = out_files
-        jobs[job_id]['phase'] = 'complete'
-        jobs[job_id]['progress'] = 100
-    except Exception as exc:
-        jobs[job_id]['status'] = 'error'
-        jobs[job_id]['phase'] = 'error'
-        jobs[job_id]['progress'] = 100
-        jobs[job_id]['error'] = str(exc)
+        def run_pipeline():
+            engine.process_to_targets(
+                input_path=str(input_path),
+                out_streaming=str(out_streaming),
+                out_hires=str(out_hires),
+                target_lufs=target_lufs,
+                tp_ceiling_db=-1.0,
+            )
+            return True
+
+        await loop.run_in_executor(None, run_pipeline)
+
+        # Return URLs (for local dev, direct file responses)
+        return JSONResponse({
+            "streaming_master": f"/download/{out_streaming.name}",
+            "hires_master": f"/download/{out_hires.name}",
+            "analysis": engine.get_last_report(),
+        })
+
+    finally:
+        # Remove the uploaded temp file — pipeline created its own derived files
+        try:
+            os.remove(input_path)
+        except Exception:
+            pass
 
 
-@app.get('/api/status/{job_id}')
-async def status(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail='Job not found')
-    data = jobs[job_id].copy()
-    # Do not leak internal paths
-    data.pop('job_dir', None)
-    return JSONResponse(data)
+@app.get("/download/{name}")
+async def download(name: str):
+    # Security: prevent path traversal
+    safe = OUTPUT_DIR / Path(name).name
+    if not safe.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(str(safe), media_type="audio/wav", filename=safe.name)
 
 
-@app.get('/api/download/{job_id}/{variant}')
-async def download(job_id: str, variant: str):
-    # variant = streaming | highres
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail='Job not found')
-    res = jobs[job_id].get('result')
-    if not res:
-        raise HTTPException(status_code=404, detail='Result not ready')
-    if variant not in res:
-        raise HTTPException(status_code=404, detail='Variant not found')
-    path = res[variant]
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail='File missing')
-    return FileResponse(path, filename=os.path.basename(path), media_type='application/octet-stream')
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

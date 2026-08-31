@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+numpy
+soundfile
+librosa
+pyloudnorm
+pedalboard
+scipy
+ffmpeg-python
