@@ -1,110 +1,104 @@
-# Mastering backend FastAPI server
-# main.py — exposes /process endpoint that accepts an audio file and returns processed masters (streaming)
+# BLACKGANG Mix Studio — Mastering backend (FastAPI)
+# main.py
+# Production-ready FastAPI app that exposes a single /master endpoint.
+# Accepts multipart file upload (wav/mp3/m4a), runs the DSP pipeline, and returns a processed WAV/MP3.
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
 import shutil
+import uuid
 import os
 import tempfile
-from pathlib import Path
-from dsp_pipeline import MasteringEngine
 import asyncio
+from pathlib import Path
 
-app = FastAPI(title="BLACKGANG One-Click Mastering - Backend",
-              description="FastAPI backend that runs an automated mastering chain.")
+from dsp_pipeline import MasteringEngine
 
-# configure CORS so the Next.js frontend (localhost:3000) can talk to it
+app = FastAPI(title="BLACKGANG Mastering Engine")
+
+# Allow the frontend (likely running on localhost:3000) to talk to the API during dev.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Create a single engine instance; it is stateless per call but we keep it for convenience
+# Single shared engine instance (lightweight). It spawns per-call workers.
 engine = MasteringEngine()
 
-OUTPUT_DIR = Path(tempfile.gettempdir()) / "blackgang_mastering_outputs"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-@app.post("/process")
-async def process_audio(file: UploadFile = File(...), target_lufs: float = -10.0):
+@app.post('/master')
+async def master_audio(
+    file: UploadFile = File(...),
+    target: str = Form('streaming'),
+    target_lufs: float = Form(-10.0),
+    format: str = Form('wav')
+):
     """
-    Accepts an uploaded audio file (wav/mp3/m4a) and returns JSON with links to
-    the processed files (streaming master and hi-res master). Files are stored
-    temporarily in the system temp directory and will be cleaned up by caller or periodic job.
+    Accepts an uploaded audio file, runs mastering, and returns the mastered file.
+    - target: 'streaming' or 'highres' (controls bitdepth/sample-rate in output)
+    - target_lufs: desired integrated LUFS (e.g. -11 to -9 recommended)
+    - format: 'wav' or 'mp3'
 
-    Query params:
-    - target_lufs: desired integrated LUFS (default -10.0). We'll clamp to [-14, -8].
+    The endpoint processes the file synchronously and streams the output back.
     """
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided")
+    # Validate extension quickly
+    filename = Path(file.filename).name
+    ext = filename.split('.')[-1].lower() if '.' in filename else ''
+    if ext not in ('wav', 'mp3', 'm4a', 'aiff', 'flac'):
+        raise HTTPException(status_code=400, detail='Unsupported audio format')
 
-    # clamp target lufs to a safe commercial range
-    target_lufs = max(-14.0, min(-8.0, float(target_lufs)))
-
-    suffix = Path(file.filename).suffix.lower()
-    if suffix not in [".wav", ".mp3", ".m4a", ".aiff", ".flac"]:
-        # let ffmpeg handle some conversions but validate extension roughly
-        pass
-
-    # create safe temp files
-    input_fd, input_path = tempfile.mkstemp(suffix=suffix, prefix="bgang_input_")
-    os.close(input_fd)
-
+    # Save upload to a secure temp file (auto-clean on close)
     try:
-        # stream uploaded file to disk (avoids loading huge files into memory)
-        with open(input_path, "wb") as f:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.' + ext) as in_tmp:
+            shutil.copyfileobj(file.file, in_tmp)
+            in_path = Path(in_tmp.name)
 
-        # process - this is run in threadpool to avoid blocking event loop
-        loop = asyncio.get_running_loop()
-        # produce two outputs: streaming (16/44.1) and hires (24/48)
-        out_streaming = OUTPUT_DIR / (Path(file.filename).stem + "_streaming.wav")
-        out_hires = OUTPUT_DIR / (Path(file.filename).stem + "_hires.wav")
+        # Choose output params
+        if target == 'highres':
+            out_sr = 48000
+            out_bits = 24
+        else:
+            out_sr = 44100
+            out_bits = 16
 
-        def run_pipeline():
-            engine.process_to_targets(
-                input_path=str(input_path),
-                out_streaming=str(out_streaming),
-                out_hires=str(out_hires),
-                target_lufs=target_lufs,
-                tp_ceiling_db=-1.0,
-            )
-            return True
+        # Create temp output path
+        out_suffix = f'.{format}' if format != 'wav' else '.wav'
+        out_path = Path(tempfile.gettempdir()) / (f'mastered-{uuid.uuid4().hex}{out_suffix}')
 
-        await loop.run_in_executor(None, run_pipeline)
+        # Run the CPU-bound pipeline in a thread to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            engine.process_file,
+            str(in_path),
+            str(out_path),
+            target_lufs,
+            out_sr,
+            out_bits,
+            format
+        )
 
-        # Return URLs (for local dev, direct file responses)
-        return JSONResponse({
-            "streaming_master": f"/download/{out_streaming.name}",
-            "hires_master": f"/download/{out_hires.name}",
-            "analysis": engine.get_last_report(),
-        })
+        if not result:
+            raise HTTPException(status_code=500, detail='Processing failed')
 
-    finally:
-        # Remove the uploaded temp file — pipeline created its own derived files
+        # Return the file as a response and schedule cleanup
+        response = FileResponse(path=str(out_path), filename=f'mastered{out_suffix}', media_type='application/octet-stream')
+
+        # Cleanup uploaded input file
         try:
-            os.remove(input_path)
+            os.remove(in_path)
         except Exception:
             pass
 
+        return response
 
-@app.get("/download/{name}")
-async def download(name: str):
-    # Security: prevent path traversal
-    safe = OUTPUT_DIR / Path(name).name
-    if not safe.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(str(safe), media_type="audio/wav", filename=safe.name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+@app.get('/health')
+async def health():
+    return JSONResponse({'status':'ok'})

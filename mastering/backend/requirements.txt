@@ -1,9 +1,14 @@
 fastapi
-uvicorn
-numpy
-soundfile
-librosa
-pyloudnorm
+uvicorn[standard]
 pedalboard
-scipy
+pyloudnorm
+librosa
+soundfile
+numpy
 ffmpeg-python
+matchering
+scipy
+
+# Notes:
+# - Some packages (librosa, matchering) have many transitive dependencies and may require system packages (libsndfile, ffmpeg).
+# - Install with: python -m pip install -r requirements.txt

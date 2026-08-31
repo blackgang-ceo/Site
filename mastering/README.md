@@ -1,5 +1,19 @@
-# BLACKGANG One-Click Mastering
+# BLACKGANG Mastering
 
-This directory contains a browser-based one-click mastering feature (backend + frontend). The backend is a FastAPI app that runs the DSP pipeline built with pedalboard, matchering, pyloudnorm, and librosa. The frontend is a Next.js page that provides a drag-and-drop UI and A/B listening.
+This folder contains a one-click mastering backend and a minimal Next.js frontend page.
 
-See: mastering/backend and mastering/frontend
+Quick dev notes:
+
+1. Backend (FastAPI)
+   - cd mastering/backend
+   - python -m venv .venv
+   - source .venv/bin/activate
+   - pip install -r requirements.txt
+   - uvicorn main:app --reload --port 8000
+
+2. Frontend (Next.js)
+   - cd mastering/frontend
+   - npm install
+   - npm run dev
+
+The frontend expects the backend to be available at /api/master; configure a proxy in your Next.js dev server (or call the backend directly at http://localhost:8000/master).
