@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-multipart
+aiofiles
+soundfile
+pyloudnorm
+librosa
+numpy
+scipy
+ffmpeg-python
+pedalboard
+matchering
+python-dotenv
